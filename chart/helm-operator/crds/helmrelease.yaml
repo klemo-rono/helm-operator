@@ -323,6 +323,21 @@ spec:
                 by the operator.
               type: integer
               format: int64
+            phase:
+              description: Phase the release is in, one of ('ChartFetched', 'ChartFetchFailed',
+                'Installing', 'Upgrading', 'Succeeded', 'RollingBack', 'RolledBack',
+                'RollbackFailed')
+              type: string
+              enum:
+              - ChartFetched
+              - ChartFetchFailed
+              - Installing
+              - Upgrading
+              - Succeeded
+              - Failed
+              - RollingBack
+              - RolledBack
+              - RollbackFailed
             releaseName:
               description: ReleaseName is the name as either supplied or generated.
               type: string
