@@ -65,9 +65,6 @@ func New(logger log.Logger, helmClients *helm.Clients, coreV1Client corev1client
 func (r *Release) Sync(hr *v1.HelmRelease) (err error) {
 	defer func(start time.Time) {
 		ObserveRelease(start, err == nil, hr.GetTargetNamespace(), hr.GetReleaseName())
-		if err != nil {
-			println("ERROR: " + err.Error())
-		}
 	}(time.Now())
 	defer status.SetObservedGeneration(r.hrClient.HelmReleases(hr.Namespace), hr, hr.Generation)
 
