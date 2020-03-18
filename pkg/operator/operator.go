@@ -27,7 +27,7 @@ import (
 
 const (
 	controllerAgentName = "helm-operator"
-	ReleaseSynced = "ReleaseSynced"
+	ReleaseSynced       = "ReleaseSynced"
 )
 
 // Controller is the operator implementation for HelmRelease resources
@@ -69,13 +69,13 @@ func New(
 	recorder := eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: controllerAgentName})
 
 	controller := &Controller{
-		logger:             logger,
-		logDiffs:           logReleaseDiffs,
-		hrLister:           hrInformer.Lister(),
-		hrSynced:           hrInformer.Informer().HasSynced,
-		releaseWorkqueue:   releaseWorkqueue,
-		recorder:           recorder,
-		release:            release,
+		logger:           logger,
+		logDiffs:         logReleaseDiffs,
+		hrLister:         hrInformer.Lister(),
+		hrSynced:         hrInformer.Informer().HasSynced,
+		releaseWorkqueue: releaseWorkqueue,
+		recorder:         recorder,
+		release:          release,
 	}
 
 	controller.logger.Log("info", "setting up event handlers")
@@ -206,11 +206,14 @@ func (c *Controller) syncHandler(key string) error {
 		c.logger.Log("error", err.Error())
 		return err
 	}
-	if err := c.release.Sync(hr.DeepCopy()); err != nil {
-		c.recorder.Event(hr, corev1.EventTypeWarning, ReleaseSynced, err.Error())
-		return nil
+	err = c.release.Sync(hr.DeepCopy())
+	if err != nil {
+		c.recorder.Event(hr, corev1.EventTypeWarning, ReleaseSynced,
+			fmt.Sprintf("synchronization of release '%s' in namespace '%s' failed: %s", hr.GetReleaseName(), hr.GetTargetNamespace(), err.Error()))
+	} else {
+		c.recorder.Event(hr, corev1.EventTypeNormal, ReleaseSynced,
+			fmt.Sprintf("release '%s' in namespace '%s' managed sychronized", hr.GetReleaseName(), hr.GetTargetNamespace()))
 	}
-	c.recorder.Event(hr, corev1.EventTypeNormal, ReleaseSynced, "Release managed by HelmRelease processed")
 	return nil
 }
 

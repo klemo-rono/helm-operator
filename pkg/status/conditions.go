@@ -74,8 +74,8 @@ func SetStatusPhase(client v1client.HelmReleaseInterface, hr *v1.HelmRelease, ph
 func ConditionForPhase(hr *v1.HelmRelease, phase v1.HelmReleasePhase) (v1.HelmReleaseCondition, bool) {
 	nowTime := metav1.NewTime(Clock.Now())
 	condition := &v1.HelmReleaseCondition{
-		Reason: 			string(phase),
-		LastUpdateTime: 	&nowTime,
+		Reason:             string(phase),
+		LastUpdateTime:     &nowTime,
 		LastTransitionTime: &nowTime,
 	}
 	switch phase {

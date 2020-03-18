@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/fluxcd/flux/pkg/git"
 	"github.com/go-kit/kit/log"
@@ -61,7 +62,13 @@ func New(logger log.Logger, helmClients *helm.Clients, coreV1Client corev1client
 }
 
 // Sync synchronizes the given HelmRelease with Helm.
-func (r *Release) Sync(hr *v1.HelmRelease) error {
+func (r *Release) Sync(hr *v1.HelmRelease) (err error) {
+	defer func(start time.Time) {
+		ObserveRelease(start, err == nil, hr.GetTargetNamespace(), hr.GetReleaseName())
+		if err != nil {
+			println("ERROR: " + err.Error())
+		}
+	}(time.Now())
 	defer status.SetObservedGeneration(r.hrClient.HelmReleases(hr.Namespace), hr, hr.Generation)
 
 	client, ok := r.helmClients.Load(hr.GetHelmVersion(r.config.DefaultHelmVersion))
@@ -78,26 +85,29 @@ func (r *Release) Sync(hr *v1.HelmRelease) error {
 		status.SetStatusPhase(r.hrClient.HelmReleases(hr.Namespace), hr, v1.HelmReleasePhaseChartFetchFailed)
 		err = fmt.Errorf("failed to prepare chart for release: %w", err)
 		logger.Log("error", err)
-		return err
+		return
 	}
 	if cleanup != nil {
 		defer cleanup()
 	}
 	status.SetStatusPhase(r.hrClient.HelmReleases(hr.Namespace), hr, v1.HelmReleasePhaseChartFetched)
 
-	values, err := composeValues(r.coreV1Client, hr, chart.chartPath)
+	var values []byte
+	values, err = composeValues(r.coreV1Client, hr, chart.chartPath)
 	if err != nil {
 		status.SetStatusPhase(r.hrClient.HelmReleases(hr.GetTargetNamespace()), hr, v1.HelmReleasePhaseFailed)
 		err = fmt.Errorf("failed to compose values for release: %w", err)
 		logger.Log("error", err)
-		return err
+		return
 	}
-	action, curRel, err := r.determineSyncAction(client, hr)
+	var action action
+	var curRel *helm.Release
+	action, curRel, err = r.determineSyncAction(client, hr)
 	if err != nil {
 		status.SetStatusPhase(r.hrClient.HelmReleases(hr.GetTargetNamespace()), hr, v1.HelmReleasePhaseFailed)
 		err = fmt.Errorf("failed to determine sync action for release: %w", err)
 		logger.Log("error", err)
-		return err
+		return
 	}
 
 	return r.run(logger, client, action, hr, curRel, chart, values)
@@ -111,7 +121,7 @@ func (r *Release) Uninstall(hr *v1.HelmRelease) error {
 		return fmt.Errorf(`no client found for Helm "%s"`, r.config.DefaultHelmVersion)
 	}
 	logger := releaseLogger(r.logger, client, hr)
-	return r.run(logger, client, UninstallAction, hr,nil, chart{}, nil)
+	return r.run(logger, client, UninstallAction, hr, nil, chart{}, nil)
 }
 
 // chart is a reference to a Helm chart used internally during the release.
@@ -143,7 +153,7 @@ func (r *Release) prepareChart(client helm.Client, hr *v1.HelmRelease) (chart, f
 		var err error
 
 		chartPath, _, err = chartsync.EnsureChartFetched(client, r.config.ChartCache, hr.Spec.RepoChartSource)
-		revision  = hr.Spec.RepoChartSource.Version
+		revision = hr.Spec.RepoChartSource.Version
 		if err != nil {
 			return chart{}, nil, err
 		}
@@ -154,6 +164,7 @@ func (r *Release) prepareChart(client helm.Client, hr *v1.HelmRelease) (chart, f
 }
 
 type action string
+
 const (
 	InstallAction       action = "install"
 	UpgradeAction       action = "upgrade"
@@ -210,7 +221,7 @@ func (r *Release) determineSyncAction(client helm.Client, hr *v1.HelmRelease) (a
 		if status.ShouldRetryUpgrade(hr) {
 			return UpgradeAction, curRel, nil
 		}
-		hist, err := client.History(hr.GetReleaseName(), helm.HistoryOptions{Namespace:hr.GetTargetNamespace(), Max: hr.GetMaxHistory()})
+		hist, err := client.History(hr.GetReleaseName(), helm.HistoryOptions{Namespace: hr.GetTargetNamespace(), Max: hr.GetMaxHistory()})
 		if err != nil {
 			return SkipAction, nil, fmt.Errorf("failed to retreive history for rolled back release: %w", err)
 		}
@@ -225,6 +236,7 @@ func (r *Release) determineSyncAction(client helm.Client, hr *v1.HelmRelease) (a
 }
 
 type runErrors []error
+
 func (err runErrors) Error() string {
 	var errs []string
 	for _, e := range err {
@@ -321,6 +333,9 @@ next:
 			logger.Log("warning", err, "phase", action)
 		}
 	}
+	if len(errs) == 0 {
+		return nil
+	}
 	return errs
 }
 
@@ -329,25 +344,36 @@ next:
 // given release. It returns the dry-run  release and a diff string,
 // or an error.
 func (r *Release) dryRunCompare(client helm.Client, rel *helm.Release, hr *v1.HelmRelease,
-	chart chart, values []byte) (*helm.Release, string, error) {
-	dryRel, err := client.UpgradeFromPath(chart.chartPath, hr.GetReleaseName(), values, helm.UpgradeOptions{
+	chart chart, values []byte) (dryRel *helm.Release, diff string, err error) {
+	defer func(start time.Time) {
+		ObserveReleaseAction(start, DryRunCompareAction, err == nil, hr.GetTargetNamespace(), hr.GetReleaseName())
+		if err != nil {
+			println(err.Error())
+		}
+	}(time.Now())
+	dryRel, err = client.UpgradeFromPath(chart.chartPath, hr.GetReleaseName(), values, helm.UpgradeOptions{
 		DryRun:      true,
 		Namespace:   hr.GetTargetNamespace(),
 		Force:       hr.Spec.ForceUpgrade,
 		ResetValues: hr.Spec.ResetValues,
 	})
 	if err != nil {
-		return nil, "", fmt.Errorf("dry-run upgrade for comparison failed: %w", err)
+		err = fmt.Errorf("dry-run upgrade for comparison failed: %w", err)
+		return
 	}
-	return dryRel, helm.Diff(rel, dryRel), nil
+	diff = helm.Diff(rel, dryRel)
+	return
 }
 
 // install performs an installation with the given HelmRelease,
 // chart, and values while recording the phases on the HelmRelease.
 // It returns the release result or an error.
-func (r *Release) install(client helm.Client, hr *v1.HelmRelease, chart chart, values []byte) (*helm.Release, error) {
+func (r *Release) install(client helm.Client, hr *v1.HelmRelease, chart chart, values []byte) (rel *helm.Release, err error) {
+	defer func(start time.Time) {
+		ObserveReleaseAction(start, InstallAction, err == nil, hr.GetTargetNamespace(), hr.GetReleaseName())
+	}(time.Now())
 	status.SetStatusPhase(r.hrClient.HelmReleases(hr.Namespace), hr, v1.HelmReleasePhaseInstalling)
-	rel, err := client.UpgradeFromPath(chart.chartPath, hr.GetReleaseName(), values, helm.UpgradeOptions{
+	rel, err = client.UpgradeFromPath(chart.chartPath, hr.GetReleaseName(), values, helm.UpgradeOptions{
 		Namespace:  hr.GetTargetNamespace(),
 		Timeout:    hr.GetTimeout(),
 		Install:    true,
@@ -358,19 +384,23 @@ func (r *Release) install(client helm.Client, hr *v1.HelmRelease, chart chart, v
 	})
 	if err != nil {
 		status.SetStatusPhase(r.hrClient.HelmReleases(hr.Namespace), hr, v1.HelmReleasePhaseFailed)
-		return nil, fmt.Errorf("installation failed: %w", err)
+		err = fmt.Errorf("installation failed: %w", err)
+		return
 	}
 	status.SetStatusPhase(r.hrClient.HelmReleases(hr.Namespace), hr, v1.HelmReleasePhaseSucceeded)
 	status.SetReleaseRevision(r.hrClient.HelmReleases(hr.Namespace), hr, chart.revision)
-	return rel, nil
+	return
 }
 
 // upgrade performs an upgrade with the given HelmRelease,
 // chart and values while recording the phases and revision on
 // the HelmRelease. It returns the release result or an error.
-func (r *Release) upgrade(client helm.Client, hr *v1.HelmRelease, chart chart, values []byte) (*helm.Release, error) {
+func (r *Release) upgrade(client helm.Client, hr *v1.HelmRelease, chart chart, values []byte) (rel *helm.Release, err error) {
+	defer func(start time.Time) {
+		ObserveReleaseAction(start, UpgradeAction, err == nil, hr.GetTargetNamespace(), hr.GetReleaseName())
+	}(time.Now())
 	status.SetStatusPhase(r.hrClient.HelmReleases(hr.Namespace), hr, v1.HelmReleasePhaseUpgrading)
-	rel, err := client.UpgradeFromPath(chart.chartPath, hr.GetReleaseName(), values, helm.UpgradeOptions{
+	rel, err = client.UpgradeFromPath(chart.chartPath, hr.GetReleaseName(), values, helm.UpgradeOptions{
 		Namespace:   hr.GetTargetNamespace(),
 		Timeout:     hr.GetTimeout(),
 		Install:     false,
@@ -382,19 +412,23 @@ func (r *Release) upgrade(client helm.Client, hr *v1.HelmRelease, chart chart, v
 	})
 	if err != nil {
 		status.SetStatusPhase(r.hrClient.HelmReleases(hr.Namespace), hr, v1.HelmReleasePhaseFailed)
-		return nil, fmt.Errorf("upgrade failed: %w", err)
+		err = fmt.Errorf("upgrade failed: %w", err)
+		return
 	}
 	status.SetStatusPhase(r.hrClient.HelmReleases(hr.Namespace), hr, v1.HelmReleasePhaseSucceeded)
 	status.SetReleaseRevision(r.hrClient.HelmReleases(hr.Namespace), hr, chart.revision)
-	return rel, nil
+	return
 }
 
 // rollback performs an upgrade for the given HelmRelease,
 // while recording the phases on  the HelmRelease. It returns
 // the release result or an error.
-func (r *Release) rollback(client helm.Client, hr *v1.HelmRelease) (*helm.Release, error) {
+func (r *Release) rollback(client helm.Client, hr *v1.HelmRelease) (rel *helm.Release, err error) {
+	defer func(start time.Time) {
+		ObserveReleaseAction(start, RollbackAction, err == nil, hr.GetTargetNamespace(), hr.GetReleaseName())
+	}(time.Now())
 	status.SetStatusPhase(r.hrClient.HelmReleases(hr.Namespace), hr, v1.HelmReleasePhaseRollingBack)
-	rel, err := client.Rollback(hr.GetReleaseName(), helm.RollbackOptions{
+	rel, err = client.Rollback(hr.GetReleaseName(), helm.RollbackOptions{
 		Namespace:    hr.GetTargetNamespace(),
 		Timeout:      hr.Spec.Rollback.GetTimeout(),
 		Wait:         hr.Spec.Rollback.Wait,
@@ -404,31 +438,39 @@ func (r *Release) rollback(client helm.Client, hr *v1.HelmRelease) (*helm.Releas
 	})
 	if err != nil {
 		status.SetStatusPhase(r.hrClient.HelmReleases(hr.Namespace), hr, v1.HelmReleasePhaseRollbackFailed)
-		return nil, fmt.Errorf("rollback failed: %w", err)
+		err = fmt.Errorf("rollback failed: %w", err)
+		return
 	}
 	status.SetStatusPhase(r.hrClient.HelmReleases(hr.Namespace), hr, v1.HelmReleasePhaseRolledBack)
-	return rel, nil
+	return
 }
 
 // annotate annotates the given release resources on the cluster with
 // the resource ID of the given HelmRelease.
-func annotate(annotator *annotator.Annotator, hr *v1.HelmRelease, rel helm.Release) error {
-	if err := annotator.Annotate(rel.Resources, hr.GetTargetNamespace(),
-		v1.AntecedentAnnotation, hr.ResourceID().String()); err != nil {
-		return fmt.Errorf("failed to annotate release resources: %w", err)
+func annotate(annotator *annotator.Annotator, hr *v1.HelmRelease, rel helm.Release) (err error) {
+	defer func(start time.Time) {
+		ObserveReleaseAction(start, AnnotateAction, err == nil, hr.GetTargetNamespace(), hr.GetReleaseName())
+	}(time.Now())
+	err = annotator.Annotate(rel.Resources, hr.GetTargetNamespace(), v1.AntecedentAnnotation, hr.ResourceID().String())
+	if err != nil {
+		err = fmt.Errorf("failed to annotate release resources: %w", err)
 	}
-	return nil
+	return
 }
 
-func uninstall(client helm.Client, hr *v1.HelmRelease) error {
-	if err := client.Uninstall(hr.GetReleaseName(), helm.UninstallOptions{
+func uninstall(client helm.Client, hr *v1.HelmRelease) (err error) {
+	defer func(start time.Time) {
+		ObserveReleaseAction(start, UninstallAction, err == nil, hr.GetTargetNamespace(), hr.GetReleaseName())
+	}(time.Now())
+	err = client.Uninstall(hr.GetReleaseName(), helm.UninstallOptions{
 		Namespace:   hr.GetTargetNamespace(),
 		KeepHistory: false,
 		Timeout:     hr.GetTimeout(),
-	}); err != nil {
-		return fmt.Errorf("uninstall failed: %w", err)
+	})
+	if err != nil {
+		err = fmt.Errorf("uninstall failed: %w", err)
 	}
-	return nil
+	return
 }
 
 // releaseLogger returns a logger in the context of the given
